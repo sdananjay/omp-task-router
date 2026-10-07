@@ -1,24 +1,35 @@
 {
-	"name": "omp-task-router",
-	"version": "0.1.0",
-	"description": "OMP extension: classify delegated task agents into configurable model tiers via a cheap classifier model",
-	"type": "module",
-	"license": "MIT",
-	"main": "./src/index.ts",
-	"files": ["src", "README.md", "LICENSE"],
-	"omp": {
-		"name": "task-router",
-		"extensions": ["./src/index.ts"]
-	},
-	"keywords": ["oh-my-pi", "omp", "omp-plugin", "model-routing"],
-	"devDependencies": {
-		"@oh-my-pi/pi-ai": "*",
-		"@oh-my-pi/pi-coding-agent": "*",
-		"bun-types": "^1.4.2",
-		"typescript": "^5"
-	},
-	"peerDependencies": {
-		"@oh-my-pi/pi-ai": "*",
-		"@oh-my-pi/pi-coding-agent": "*"
-	}
+  "name": "omp-task-router",
+  "version": "0.1.1",
+  "description": "OMP extension: classify delegated task agents into configurable model tiers via a cheap classifier model",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "name": "task-router",
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "omp-plugin",
+    "model-routing"
+  ],
+  "devDependencies": {
+    "@oh-my-pi/pi-ai": "*",
+    "@oh-my-pi/pi-coding-agent": "*",
+    "bun-types": "^1.4.2",
+    "typescript": "^5"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-ai": "*",
+    "@oh-my-pi/pi-coding-agent": "*"
+  }
 }
