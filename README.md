@@ -187,6 +187,26 @@ include task, solution space, classifier model/prompt and ordered tier IDs.
 Changing a model mapping reuses the classification; changing tier IDs
 reclassifies.
 
+### Configuration scope
+
+Task Router configuration is currently global, while OMP model roles remain project-aware.
+
+Task Router maps tiers to OMP model selectors such as "@tiny", "@task", and "@slow". These selectors are resolved by OMP using the effective configuration for the current project.
+
+This means projects can provide different "modelRoles" mappings through their project-specific OMP configuration without changing Task Router:
+
+```
+Task Router              Project A              Project B
+
+cheap → @tiny       →    @tiny → model A        @tiny → model B
+normal → @task      →    @task → model C        @task → model D
+hard → @slow        →    @slow → model E        @slow → model F
+```
+
+Task Router's own settings — including tiers, classifier model, classifier prompt, cache settings, and routing behaviour — are currently global.
+
+Project-specific Task Router settings are not yet supported.
+
 ### Safety and current limits
 
 - **Concrete model selectors and non-generic, non-tier role aliases are
