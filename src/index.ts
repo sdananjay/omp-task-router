@@ -1,7 +1,7 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import { classify } from "./classifier";
-import { DEFAULT_CONFIG, loadConfig } from "./config";
+import { loadConfig } from "./config";
 import { Router } from "./router";
 import type { ClassifyFn } from "./router";
 import { registerUi } from "./ui";
@@ -19,9 +19,13 @@ export default function taskRouterExtension(pi: ExtensionAPI): void {
 	let router: Router | undefined;
 	const pending = new Map<string, Map<number, { text: StashedText; spawnKey?: string }>>();
 
-	function ensureRouter(classifyFn: ClassifyFn): Router {
-		router ??= new Router(DEFAULT_CONFIG, classifyFn);
+	async function ensureRouter(ctx: ExtensionContext): Promise<Router> {
+		const { config } = await loadConfig();
+		const classifyFn: ClassifyFn = async (input, cfg, signal) =>
+			classify({ task: input.task, solutionSpace: input.solutionSpace }, ctx, cfg, Object.keys(cfg.tiers), signal);
+		router ??= new Router(config, classifyFn);
 		router.setClassifier(classifyFn);
+		router.reload(config);
 		return router;
 	}
 
@@ -123,11 +127,7 @@ export default function taskRouterExtension(pi: ExtensionAPI): void {
 			}
 
 			// Consume before the first await: cleanup or another hook cannot steal it.
-			const { config } = await loadConfig();
-			const classifyFn: ClassifyFn = async (input, cfg, signal) =>
-				classify({ task: input.task, solutionSpace: input.solutionSpace }, ctx, cfg, Object.keys(cfg.tiers), signal);
-			const active = ensureRouter(classifyFn);
-			active.reload(config);
+			const active = await ensureRouter(ctx);
 			const verdict = await active.route(
 				{
 					task: text.task,
@@ -165,7 +165,7 @@ export default function taskRouterExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// UI reads router state per session.
-	registerUi(pi, () => router, () => undefined);
+	// Commands initialize state independently of task-spawn correlation.
+	registerUi(pi, ensureRouter, () => undefined);
 
 }

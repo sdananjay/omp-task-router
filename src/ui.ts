@@ -70,7 +70,7 @@ export function formatTestResult(input: { task?: string; solutionSpace?: string 
 }
 
 /** Register the /task-router command with subcommand + interactive menu. */
-export function registerUi(pi: ExtensionAPI, getRouter: () => Router | undefined, sessionId: () => string | undefined): void {
+export function registerUi(pi: ExtensionAPI, getRouter: (ctx: ExtensionContext) => Promise<Router>, sessionId: () => string | undefined): void {
 	pi.registerCommand("task-router", {
 		description: "task-router status/enable/disable/history/test/prompt/tiers/reload",
 		getArgumentCompletions: prefix =>
@@ -78,11 +78,7 @@ export function registerUi(pi: ExtensionAPI, getRouter: () => Router | undefined
 				.filter(sub => sub.startsWith(prefix.trim()))
 				.map(sub => ({ value: sub, label: sub })),
 		async handler(args, ctx) {
-			const router = getRouter();
-			if (!router) {
-				ctx.ui.notify("task-router: not initialized", "error");
-				return;
-			}
+			const router = await getRouter(ctx);
 			const sub = args.trim().split(/\s+/)[0] ?? "";
 			switch (sub) {
 				case "":

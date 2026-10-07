@@ -48,10 +48,10 @@ Restart OMP to load the extension. The defaults use these OMP roles:
 Model availability and credentials come from your OMP configuration. Tier
 selection is a model judgment, not a fixed rule or a correctness guarantee.
 
-Delegate a task, then use `/task-router history` to inspect its routing.
-`/task-router` opens the menu; `/task-router test` lets you tune routing without
-launching another agent. Commands initialize after the first task spawn that
-can be safely correlated; until then, they report `not initialized`.
+`/task-router` opens the menu immediately—no delegated task is needed to
+initialize it. Use `/task-router status` to inspect your configuration or
+`/task-router test` to tune routing without launching an agent. After delegating
+tasks, use `/task-router history` to inspect their routing decisions.
 
 ## A hundred files can be easy. Five lines can be hard.
 

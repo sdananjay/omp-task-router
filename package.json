@@ -1,6 +1,6 @@
 {
   "name": "omp-task-router",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OMP extension: classify delegated task agents into configurable model tiers via a cheap classifier model",
   "type": "module",
   "license": "MIT",

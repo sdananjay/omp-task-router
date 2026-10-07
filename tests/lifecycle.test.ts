@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthStorage, createAgentSession, ModelRegistry, SessionManager, Settings, AgentRegistry, type ExtensionContext, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { cfgAsyncEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
@@ -108,6 +109,41 @@ async function lifecycleScenario() {
 				});
 			}],
 		}));
+		// Commands must work before any delegated task, including with non-default config.
+		const notices: string[] = [];
+		const testInputs = ["hard-task-command", "Unknown cause; inspect synchronization paths"];
+		assert(session.extensionRunner);
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => { throw error; },
+			reportRuntimeError: error => { throw new Error(error.error); },
+			uiContext: {
+				...session.extensionRunner.getUIContext(),
+				notify: message => { notices.push(message); },
+				select: async () => "Disable routing",
+				input: async () => testInputs.shift(),
+			},
+		});
+		await session.prompt("/task-router status");
+		const startupStatus = notices.at(-1)!;
+		assert.match(startupStatus, /enabled: true/);
+		assert.match(startupStatus, /classifier: router-test\/classifier/);
+		assert.equal(children.length, 0);
+		assert.equal(classified.length, 0);
+		await session.prompt("/task-router");
+		const disabledConfig = await Bun.file(join(dir, "task-router/config.json")).json();
+		assert.equal(disabledConfig.enabled, false);
+		assert.equal(disabledConfig.respectExplicitModel, true);
+		await session.prompt("/task-router test");
+		const testResult = notices.at(-1)!;
+		assert.match(testResult, /tier: hard/);
+		assert.match(testResult, /model: router-test\/hard/);
+		assert.equal(children.length, 0);
+		assert.equal(classified.length, 1);
+		classified.length = 0;
+		await session.prompt("/task-router enable");
+		assert.equal((await Bun.file(join(dir, "task-router/config.json")).json()).enabled, true);
+		if (process.argv.includes("--smoke")) console.log(`Fresh-session status:\n${startupStatus}\nClassifier test without a delegated task:\n${testResult}`);
+
 		const item = (task: string, agent = "task") => ({ agent, task, solutionSpace: `solution-${task}` });
 		const call = (id: string, args: Record<string, unknown>): ToolCall => ({ type: "toolCall", id, name: "task", arguments: args });
 		for (const calls of [
@@ -187,10 +223,10 @@ async function lifecycleScenario() {
 
 if (process.argv.includes("--smoke")) {
 	await lifecycleScenario();
-	console.log("OMP lifecycle smoke passed: rejection, preflight failure, reversed batch, overlapping calls, queued background IDs, name collisions, timeout and abort fallbacks");
+	console.log("OMP lifecycle smoke passed: fresh-session commands, persisted toggles, classifier test, rejection, preflight failure, reversed batch, overlapping calls, queued background IDs, name collisions, timeout and abort fallbacks");
 	// One-shot SDK host: async artifact-retention timers can outlive disposal.
 	process.exit(0);
 } else {
 	const { test } = await import("bun:test");
-	test("OMP lifecycle correlates batches and overlapping calls after rejected and failed calls", lifecycleScenario, 60000);
+	test("OMP lifecycle initializes commands before tasks and safely correlates delegated spawns", lifecycleScenario, 60000);
 }

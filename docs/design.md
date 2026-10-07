@@ -139,6 +139,12 @@ unknown_tier | default_tier_used | no_mapping | task_left_unchanged`.
 
 ## UI (commands)
 
+Commands and safely correlated spawns share `ensureRouter(ctx)`: load current
+configuration, create or update the router, and bind classification to the
+current OMP context. Commands initialize independently of task correlation; the
+menu, status, toggles, reload and classifier test work before the first task.
+Initialization itself makes no classifier request.
+
 Single `/task-router` command, subcommand-style (ponytail pattern):
 - (no args) → interactive menu: `select` between Status / Enable / Disable /
   History / Test / Edit prompt / Edit tiers / Reload.
@@ -186,7 +192,8 @@ mapping attempted; if that mapping missing/unresolvable → return undefined
   warm-cache behavior, tier renames and history outcomes.
 - `tests/lifecycle.test.ts`: actual SDK sessions, agent loop, TaskTool, extension
   runner and child yield execution using a local scripted provider. Exercises
-  rejection, preflight failure, reversed batch order, overlapping calls, queued
-  background IDs after settlement, unsafe names and real provider
-  timeout/abort/error responses.
+  fresh-session status, persisted menu toggles and classifier testing before any
+  delegated task, plus rejection, preflight failure, reversed batch order,
+  overlapping calls, queued background IDs after settlement, unsafe names and
+  real provider timeout/abort/error responses.
 - Standalone smoke: `bun run tests/lifecycle.test.ts --smoke` (no cloud requests).
