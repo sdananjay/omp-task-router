@@ -64,13 +64,14 @@ export class Router {
 		return this.#config;
 	}
 
-	reload(config: RouterConfig, previous?: RouterConfig): void {
+	reload(config: RouterConfig): void {
+		const previous = this.#config;
 		this.#config = config;
 		// Classification-relevant inputs unchanged → keep warm cache entries.
 		if (
-			previous &&
 			previous.classifier.model === config.classifier.model &&
-			previous.classifier.prompt === config.classifier.prompt
+			previous.classifier.prompt === config.classifier.prompt &&
+			JSON.stringify(Object.keys(previous.tiers)) === JSON.stringify(Object.keys(config.tiers))
 		) {
 			return;
 		}
@@ -80,11 +81,6 @@ export class Router {
 	/** Swap the classify fn (ctx changes per spawn event). */
 	setClassifier(classify: ClassifyFn): void {
 		this.#classify = classify;
-	}
-
-	/** Current cache entry count (test/observability seam). */
-	cacheSize(): number {
-		return this.cache.size;
 	}
 
 	record(decision: RoutingDecision): void {
@@ -185,7 +181,8 @@ export class Router {
 		signal: AbortSignal | undefined,
 		decision: RoutingDecision,
 	): Promise<ClassifiedTier | undefined> {
-		const cacheKey = this.#config.classifier.cache ? cacheKeyFor(input, this.#config.classifier) : undefined;
+		const config = this.#config;
+		const cacheKey = config.classifier.cache ? cacheKeyFor(input, config) : undefined;
 		if (cacheKey) {
 			const hit = this.cache.get(cacheKey);
 			if (hit) {
@@ -195,7 +192,7 @@ export class Router {
 		}
 		const start = performance.now();
 		try {
-			const classified = await this.#classify(input, this.#config, signal);
+			const classified = await this.#classify(input, config, signal);
 			decision.classificationLatencyMs = Math.round(performance.now() - start);
 			if (classified === undefined) {
 				decision.outcome = "classifier_failed";
@@ -276,18 +273,6 @@ export type ClassifyFn = (
 	signal: AbortSignal | undefined,
 ) => Promise<ClassifiedTier | undefined>;
 
-function cacheKeyFor(input: RoutingInput, classifier: RouterConfig["classifier"]): string {
-	const material = [
-		input.task ?? "",
-		"\u0000",
-		input.solutionSpace ?? "",
-		"\u0000",
-		classifier.model,
-		String(classifier.prompt.length),
-	].join("");
-	let hash = 5381;
-	for (let i = 0; i < material.length; i++) {
-		hash = (hash * 33) ^ material.charCodeAt(i);
-	}
-	return String(hash >>> 0);
+function cacheKeyFor(input: RoutingInput, config: RouterConfig): string {
+	return JSON.stringify([input.task ?? "", input.solutionSpace ?? "", config.classifier.model, config.classifier.prompt, Object.keys(config.tiers)]);
 }

@@ -1,11 +1,11 @@
 # OMP (can1357/oh-my-pi) Integration Notes
 
-Verified against `@oh-my-pi/pi-coding-agent@<installed>` source at
-`~/.omp/plugins/node_modules/@oh-my-pi/` (paths below relative to that root,
-unless prefixed otherwise). OMP binary: `omp/18.4.12` — the binary itself is
-compiled; the extension surface is the TS in these packages. User config:
-`~/.omp/agent/config.yml` contains `modelRoles:` (default, smol, slow, plan,
-task, tiny, memory, advisor, commit) and `retry.fallbackChains`.
+Lifecycle correlation rechecked against this checkout's installed
+`@oh-my-pi/pi-coding-agent@18.6.3` source under `node_modules/@oh-my-pi/`.
+Paths below are relative to that package root. The regression and standalone
+smoke run actual SDK sessions with a local scripted provider, not cloud inference.
+OMP model roles and fallback chains remain configured in
+`~/.omp/agent/config.yml`.
 
 ## 1. Extension loading
 
@@ -49,16 +49,16 @@ Caveats found in source: the returned `input` is "revalidated against the tool
 schema" for model-issued calls; nested/dispatched calls have different paths.
 For `task`, the actual wire schema (`src/task/types.ts:44+`,
 arktype, `"+": "delete"` strips unknown keys) is
-`{ name?, agent (= 'task' default), task, solutionSpace, outputSchema?,
-schemaMode?, tools?, isolated?, effort? }` (+ `context, tasks[]` in batch
-mode). **No `model` field on the task tool wire schema.** Also `lenientArgValidation
-= true` on TaskTool, unknown keys would be forwarded raw.
+`{ name?, agent (= 'task' default), task, solutionSpace, model?, outputSchema?,
+schemaMode?, tools?, isolated?, effort? }` (+ `context, tasks[]` in batch mode).
+Current OMP supports explicit `model` selectors. The router observes inputs but
+never rewrites them; inherited model routing happens at the spawn hook.
 
-`ToolCallEventResult.input` replaces the input used by the tool's `execute`.
-Since the schema strips unknown keys and the tool maps `TaskParams -> request`
-through explicit field copies (`src/task/index.ts:1605+`), the task tool
-**cannot be told "route to role X" via the input** — there is no model passthrough
-field to inject. So `tool_call` alone can't retarget spawn model.
+`tool_call` precedes validation/approval and need not produce a spawn.
+`tool_execution_start` supplies the executed arguments. `tool_execution_update`
+supplies TaskTool progress rows with original `index` and allocated `id`.
+`tool_result` / `tool_execution_end` settle calls; approval rejection can occur
+without a tool-result event, so `tool_approval_resolved` also purges pending text.
 
 ### b) `before_subagent_spawn` (chosen)
 
@@ -73,6 +73,13 @@ model**, for task-tool spawns AND eval `agent()`:
   patterns: string[];            // expanded model patterns in attempt order
   spawnKey?: string }
 ```
+
+`applySpawnHook` chooses `identity.id ?? identity.label ??
+(parentToolCallId + ":" + index)`. Allocated IDs and labels are not origin call
+IDs. The router matches only indexed keys or IDs bound by progress events;
+unknown/ambiguous keys leave the spawn untouched. Named synchronous and early
+speculative launches without progress binding cannot be routed safely with the
+current event contract. Full coverage needs origin call ID/index on the event.
 
 Emitted exactly once per actual child dispatch
 (`src/task/structured-subagent.ts::applySpawnHook`, called from
@@ -100,22 +107,18 @@ supplied by us or by `modelRole` preserved). Verified semantics: setting
 `model` on this hook is exactly the built-in "model-pools" style routing
 seam, comment says "Extension routing note (e.g. model-pools) explaining why
 resolvedModel was chosen."
-- Distinguishing explicit-vs-inherited model at this event = compare
-  `event.patterns` after `resolveAgentModelSelection(...)`. If the source
-  selector resolved to a pattern, `modelRole` is **undefined** whenever the
-  selection came from a non-role-alias source (explicit model / pattern);
-  inherited/agent-default (`@task`) has `modelRole: "task"`,
-  inherited session default has `modelRole: "default"` via
-  `isSessionInheritedAgentPattern` (`model-resolver.ts:1086-1091`).
+- Preservation is determined from `event.modelRole`, not by comparing expanded
+  `event.patterns`. Non-role selectors have undefined `modelRole` and are
+  preserved when `respectExplicitModel` is true. Generic `task`/`default` roles
+  and configured tier IDs remain routable; other role aliases are preserved.
+  An explicitly supplied `@task` is indistinguishable from the agent default
+  at this hook and is intentionally routable.
 
 ### Why not `tool_call`
 
-- `task` wire schema has no `model` selector, and arktype `"+": "delete"`
-  strips unknown keys, so returning `{input: {...input, model: "@task_hard"}}`
-  would be silently dropped at validation, or forwarded raw under
-  `lenientArgValidation` then ignored by `TaskParams -> StructuredSubagentRequest`
-  mapping (there is no `params.model` in `#runSpawn`, `src/task/index.ts:1605+`).
-  Verified: `TaskParams` has no `model` field.
+- Rewriting `task` input would mix routing with explicit selectors and bypass
+  the purpose-built spawn seam. Observe task text, then return a model only
+  from `before_subagent_spawn` after checking OMP's `modelRole` policy.
 - `before_subagent_spawn` is a purpose-built extension seam with exactly the
   intended semantics ("Role identity is preserved", `note` displayed in UI,
   explicit routing comment referencing model-pools). It fires for every real
@@ -191,12 +194,18 @@ stopReason `error`/`aborted` → treat as classification failure (fail-open).
 
 ## 6. Explicit model on task input
 
-The `task` tool wire schema has **no `model` parameter**. Explicit model
-selection for subagents happens through:
-- `task.agentModelOverrides` setting (per-agent-name model overrides),
-- agent definitions' own `model: "@task"` frontmatter,
-- session active model (`--model`).
-At `before_subagent_spawn`, we can only see `modelRole` + `patterns`. We can
-detect "explicit" as `modelRole === undefined` (no role-alias source) but NOT
-as "explicitly chosen by the user in the tool call" (no such channel).
-Documented limitation, see design.md.
+Current task schemas accept an optional `model` selector or selector array on
+each `tasks[]` item, or on a flat single-task call—not on the batch container.
+Agent model overrides, definition frontmatter and inherited session models also
+feed model selection. At `before_subagent_spawn`, undefined `modelRole` denotes
+a non-role selector and is preserved with `respectExplicitModel: true`. Generic
+`task`/`default` roles and aliases matching configured tier IDs remain routable;
+all other role aliases are preserved. This applies even when `@task` was supplied
+explicitly, or its role mapping expands to a concrete model: the hook preserves
+role identity, not request-level explicitness. Setting `respectExplicitModel`
+to false allows replacement of protected selections. The enable/disable command
+and menu toggle change only `enabled`; disabled routing bypasses classification
+regardless of this policy.
+
+The router's policy is the single authority for preserving explicit selectors;
+no second config helper interprets undefined roles differently.

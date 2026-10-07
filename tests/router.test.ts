@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseClassifierOutput } from "../src/classifier";
-import { DEFAULT_PROMPT, DEFAULT_TIERS, isExplicitModelRequest, loadConfig, preview, renderPromptForTiers } from "../src/config";
+import { DEFAULT_PROMPT, DEFAULT_TIERS, preview, renderPromptForTiers } from "../src/config";
 import type { RouterConfig } from "../src/config";
 import { Router } from "../src/router";
 import type { ClassifyFn, RoutingInput } from "../src/router";
@@ -51,27 +51,53 @@ describe("review fixes", () => {
 		expect(verdict.result?.model).toBe("@slow");
 	});
 
-	test("cache survives unchanged reload, clears on classifier change", () => {
-		const counting: ClassifyFn = async () => ({ tier: "cheap", reason: undefined });
-		const router = new Router(CFG, counting);
-		const same = { ...CFG };
-		// Unchanged classifier inputs → not cleared; changed model → cleared.
-		router.reload({ ...CFG }, same);
-		router.reload({ ...CFG, classifier: { ...CFG.classifier, model: "@other" } }, CFG);
-		// Observable via classify call count: after change, a re-route classifies again.
-		return router.route(input(), undefined).then(() => {
-			const after = router.cacheSize();
-			expect(after).toBe(1);
-		});
+	test("warm cache survives mapping changes but not classifier inputs", async () => {
+		let calls = 0;
+		const router = new Router(CFG, async () => { calls++; return { tier: "cheap", reason: undefined }; });
+		await router.route(input(), undefined);
+		router.reload({ ...CFG });
+		await router.route(input(), undefined);
+		expect(calls).toBe(1);
+		router.reload({ ...CFG, tiers: { ...CFG.tiers, cheap: { model: "@other" } } });
+		expect((await router.route(input(), undefined)).result?.model).toBe("@other");
+		expect(calls).toBe(1);
+		router.reload({ ...CFG, classifier: { ...CFG.classifier, prompt: "Changed {tiers}" } });
+		await router.route(input(), undefined);
+		expect(calls).toBe(2);
+		router.reload({ ...CFG, classifier: { ...CFG.classifier, model: "@other" } });
+		await router.route(input(), undefined);
+		expect(calls).toBe(3);
 	});
 
-	test("FIFO queue pairs overlapping tool calls in emission order", () => {
-		// Structural: pending queue consumed shift()-first; two calls → two entries.
-		const calls: string[] = [];
-		const q: string[] = [];
-		q.push("call1", "call2");
-		calls.push(q.shift()!, q.shift()!);
-		expect(calls).toEqual(["call1", "call2"]);
+	test("an in-flight old classification cannot repopulate the new tier cache", async () => {
+		const first = Promise.withResolvers<{ tier: string; reason: undefined }>();
+		let calls = 0;
+		const router = new Router(CFG, async (_, config) => {
+			calls++;
+			return calls === 1 ? first.promise : { tier: config.tiers.cheap ? "cheap" : "budget", reason: undefined };
+		});
+		const pending = router.route(input(), undefined);
+		router.reload({ ...CFG, tiers: { budget: { model: "@tiny" }, normal: CFG.tiers.normal!, hard: CFG.tiers.hard! } });
+		first.resolve({ tier: "cheap", reason: undefined });
+		await pending;
+		const verdict = await router.route(input(), undefined);
+		expect(verdict.result?.model).toBe("@tiny");
+		expect(verdict.decision.outcome).toBe("routed");
+		expect(calls).toBe(2);
+	});
+
+	test("renaming a tier reclassifies the same task instead of using a removed tier", async () => {
+		let calls = 0;
+		const router = new Router(CFG, async (_, config) => {
+			calls++;
+			return { tier: config.tiers.cheap ? "cheap" : "budget", reason: undefined };
+		});
+		await router.route(input(), undefined);
+		router.reload({ ...CFG, tiers: { budget: { model: "@tiny" }, normal: CFG.tiers.normal!, hard: CFG.tiers.hard! } });
+		const verdict = await router.route(input(), undefined);
+		expect(verdict.result?.model).toBe("@tiny");
+		expect(verdict.decision.outcome).toBe("routed");
+		expect(calls).toBe(2);
 	});
 });
 
@@ -190,21 +216,8 @@ describe("config helpers", () => {
 		expect(rendered).toContain("- hard");
 	});
 
-	test("isExplicitModelRequest", () => {
-		expect(isExplicitModelRequest("task", true)).toBe(false);
-		expect(isExplicitModelRequest("default", true)).toBe(false);
-		expect(isExplicitModelRequest("task_cheap", true)).toBe(true);
-		expect(isExplicitModelRequest(undefined, true)).toBe(false);
-		expect(isExplicitModelRequest("task_cheap", false)).toBe(false);
-	});
-
 	test("preview truncates", () => {
 		expect(preview("x".repeat(100))).toHaveLength(80);
 	});
 
-	test("loadConfig tolerates missing file", async () => {
-		// No config file in this environment yet — must not throw.
-		const { config } = await loadConfig();
-		expect(config.defaultTier).toBe("normal");
-	});
 });

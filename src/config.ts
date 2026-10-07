@@ -113,13 +113,6 @@ export function renderPromptForTiers(prompt: string, tiers: TierMap): string {
 	return prompt.replace("{tiers}", list);
 }
 
-/** Is this task spawn exempt from routing (explicit model request)? */
-export function isExplicitModelRequest(modelRole: string | undefined, respectExplicitModel: boolean): boolean {
-	if (!respectExplicitModel) return false;
-	// Inherited/agent-default roles route; anything else is an explicit selector.
-	return modelRole !== undefined && modelRole !== "default" && modelRole !== "task";
-}
-
 export function preview(text: string | undefined, max = 80): string {
 	const t = (text ?? "").replace(/\s+/g, " ").trim();
 	return t.length > max ? `${t.slice(0, max - 1)}…` : t;

@@ -86,6 +86,7 @@ export async function classify(
 
 	const timeout = AbortSignal.timeout(config.classifier.timeoutMs);
 	const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+	requestSignal.throwIfAborted();
 	const sessionId = ctx.sessionManager.getSessionId();
 	const message = await completeSimple(
 		model,
@@ -99,8 +100,13 @@ export async function classify(
 			maxTokens: 256,
 			signal: requestSignal,
 		},
-	);
-	if (message.stopReason === "error" || message.stopReason === "aborted") {
+	).catch(error => {
+		requestSignal.throwIfAborted();
+		throw error;
+	});
+	requestSignal.throwIfAborted();
+	if (message.stopReason === "aborted") throw new DOMException("classifier request aborted", "AbortError");
+	if (message.stopReason === "error") {
 		throw new Error(`classifier request failed: ${message.stopReason}`);
 	}
 	const text = message.content

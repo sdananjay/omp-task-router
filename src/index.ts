@@ -1,97 +1,133 @@
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 import { classify } from "./classifier";
-import { DEFAULT_PROMPT, DEFAULT_TIERS, loadConfig, preview } from "./config";
-import type { RouterConfig } from "./config";
+import { DEFAULT_CONFIG, loadConfig } from "./config";
 import { Router } from "./router";
-import type { ClassifyFn, RoutingInput } from "./router";
+import type { ClassifyFn } from "./router";
 import { registerUi } from "./ui";
 
 interface StashedText {
+	name: string | undefined;
 	task: string | undefined;
 	solutionSpace: string | undefined;
 	effort: string | undefined;
 }
 
-/** Failsafe config used until loadConfig() succeeds; identical to defaults. */
-const FALLBACK_CONFIG: RouterConfig = {
-	enabled: true,
-	classifier: { model: "@tiny", prompt: DEFAULT_PROMPT, timeoutMs: 8000, cache: true },
-	defaultTier: "normal",
-	respectExplicitModel: true,
-	tiers: DEFAULT_TIERS,
-};
-
 export default function taskRouterExtension(pi: ExtensionAPI): void {
 	// Fail-open wrapper: session state lives in the factory closure; a throw
 	// anywhere in our handlers must never break the spawn.
 	let router: Router | undefined;
-	let liveCtx: ExtensionContext | undefined;
-	/**
-	 * Pending task texts in tool_call emission order. Spawns dispatch
-	 * sequentially per task call and calls dispatch in order, so spawn N pairs
-	 * with queue entry N (batch items pushed in item order). Each entry carries
-	 * its toolCallId so a later tool_call with the same id (streaming partial →
-	 * final) REPLACES its earlier entry instead of duplicating it.
-	 */
-	const pending: Array<{ toolCallId: string; text: StashedText }> = [];
+	const pending = new Map<string, Map<number, { text: StashedText; spawnKey?: string }>>();
 
 	function ensureRouter(classifyFn: ClassifyFn): Router {
-		router ??= new Router(FALLBACK_CONFIG, classifyFn);
+		router ??= new Router(DEFAULT_CONFIG, classifyFn);
 		router.setClassifier(classifyFn);
 		return router;
 	}
 
-	pi.on("tool_call", async (event, ctx) => {
-		try {
-			if (event.toolName !== "task") return undefined;
-			liveCtx = ctx;
-			const input = event.input as Record<string, unknown> | undefined;
-			if (!input) return undefined;
-			const effortOf = (raw: unknown): string | undefined => (typeof raw === "string" ? raw : undefined);
-			const readText = (item: Record<string, unknown>): StashedText => ({
+	function capture(toolCallId: string, raw: unknown): void {
+		pending.delete(toolCallId);
+		if (!raw || typeof raw !== "object") return;
+		const input = raw as Record<string, unknown>;
+		const items = Array.isArray(input.tasks) ? input.tasks : [input];
+		const entries = new Map<number, { text: StashedText; spawnKey?: string }>();
+		items.forEach((rawItem, index) => {
+			if (!rawItem || typeof rawItem !== "object") return;
+			const item = rawItem as Record<string, unknown>;
+			entries.set(index, { text: {
+				name: typeof item.name === "string" ? item.name.trim() : undefined,
 				task: typeof item.task === "string" ? item.task : undefined,
 				solutionSpace: typeof item.solutionSpace === "string" ? item.solutionSpace : undefined,
-				effort: effortOf(item.effort),
-			});
-			let texts: StashedText[];
-			if (Array.isArray(input.tasks)) {
-				texts = (input.tasks as unknown[]).map(item =>
-					item && typeof item === "object" && "task" in item ? readText(item as Record<string, unknown>) : { task: undefined, solutionSpace: undefined, effort: undefined },
-				);
-			} else {
-				texts = [readText(input)];
+				effort: typeof item.effort === "string" ? item.effort : undefined,
+			} });
+		});
+		if (entries.size) pending.set(toolCallId, entries);
+	}
+
+	// OMP progress rows bind an allocated agent id to the original call/index.
+	function bindProgress(toolCallId: string, raw: unknown, settled = false): void {
+		const entries = pending.get(toolCallId);
+		if (!entries) return;
+		const details = (raw as { details?: { progress?: { index: number; id: string; status: string }[]; async?: { state: string } } } | undefined)?.details;
+		const queued = new Set<number>();
+		for (const row of details?.progress ?? []) {
+			if (typeof row.id !== "string" || !Number.isInteger(row.index)) continue;
+			if (row.status !== "pending" && row.status !== "running") {
+				entries.delete(row.index);
+				continue;
 			}
-			// Streaming partial events replace this call's entries; a later call appends.
-			const kept = pending.filter(entry => entry.toolCallId !== event.toolCallId);
-			pending.length = 0;
-			pending.push(...kept, ...texts.map(text => ({ toolCallId: event.toolCallId, text })));
-			// Keep the raw input untouched — classification happens on the spawn hook.
-			return undefined;
-		} catch {
-			return undefined;
+			const entry = entries.get(row.index);
+			if (entry) entry.spawnKey = row.id;
+			if (details?.async?.state === "running") queued.add(row.index);
+		}
+		// A returned background call may still have children waiting for a permit.
+		if (settled) for (const index of entries.keys()) if (!queued.has(index)) entries.delete(index);
+		if (!entries.size) pending.delete(toolCallId);
+	}
+
+	pi.on("tool_call", event => {
+		if (event.toolName === "task") capture(event.toolCallId, event.input);
+	});
+	pi.on("tool_execution_start", event => {
+		if (event.toolName === "task") capture(event.toolCallId, event.args);
+	});
+	pi.on("tool_execution_update", event => {
+		if (event.toolName === "task") bindProgress(event.toolCallId, event.partialResult);
+	});
+	pi.on("tool_result", event => {
+		if (event.toolName !== "task") return;
+		if (event.isError) pending.delete(event.toolCallId);
+		else bindProgress(event.toolCallId, event, true);
+	});
+	pi.on("tool_execution_end", event => {
+		if (event.toolName !== "task") return;
+		if (event.isError) pending.delete(event.toolCallId);
+		else bindProgress(event.toolCallId, event.result, true);
+	});
+	pi.on("tool_approval_resolved", event => {
+		if (event.toolName === "task" && !event.approved) pending.delete(event.toolCallId);
+	});
+	pi.on("turn_end", () => {
+		for (const [id, entries] of pending) {
+			for (const [index, entry] of entries) if (!entry.spawnKey) entries.delete(index);
+			if (!entries.size) pending.delete(id);
 		}
 	});
+	pi.on("session_switch", () => pending.clear());
+	pi.on("session_shutdown", () => pending.clear());
 
 	pi.on("before_subagent_spawn", async (event, ctx) => {
 		try {
-			liveCtx = ctx;
-			const { config } = await loadConfig();
-			const classifyFn: ClassifyFn = async (input, cfg, signal) =>
-				classify({ task: input.task, solutionSpace: input.solutionSpace }, ctx, cfg, Object.keys(cfg.tiers), signal);
-			const active = ensureRouter(classifyFn);
-			active.reload(config, active.config);
-
-			// Pair spawn with stashed text: FIFO in emission order (see pending docs).
-			let text: StashedText | undefined;
-			if (event.invocationKind === "task" && pending.length > 0) {
-				text = pending.shift()!.text;
+			if (event.invocationKind !== "task" || !event.spawnKey) return undefined;
+			let match: { callId: string; index: number; text: StashedText } | undefined;
+			for (const [callId, entries] of pending) {
+				for (const [index, entry] of entries) {
+					// A caller-supplied label can itself look like another call:index.
+					if (!entry.spawnKey && entry.text.name === event.spawnKey && event.spawnKey !== `${callId}:${index}`) return undefined;
+					if (event.spawnKey !== (entry.spawnKey ?? `${callId}:${index}`)) continue;
+					if (match) return undefined; // ambiguous key: never guess
+					match = { callId, index, text: entry.text };
+				}
 			}
+			const text = match?.text;
+			if (match) {
+				const entries = pending.get(match.callId)!;
+				entries.delete(match.index);
+				if (!entries.size) pending.delete(match.callId);
+			}
+			// ponytail: names/opaque keys without progress cannot identify a call;
+			// leave untouched until OMP exposes parentToolCallId + index in this event.
 
 			if (!text || (text.task === undefined && text.solutionSpace === undefined)) {
 				return undefined; // eval agents, speculative launches, no text — leave untouched
 			}
 
+			// Consume before the first await: cleanup or another hook cannot steal it.
+			const { config } = await loadConfig();
+			const classifyFn: ClassifyFn = async (input, cfg, signal) =>
+				classify({ task: input.task, solutionSpace: input.solutionSpace }, ctx, cfg, Object.keys(cfg.tiers), signal);
+			const active = ensureRouter(classifyFn);
+			active.reload(config);
 			const verdict = await active.route(
 				{
 					task: text.task,
@@ -132,9 +168,4 @@ export default function taskRouterExtension(pi: ExtensionAPI): void {
 	// UI reads router state per session.
 	registerUi(pi, () => router, () => undefined);
 
-	// preview re-exported for tests below.
-	void preview;
 }
-
-// Re-exported for tests.
-export { DEFAULT_PROMPT, DEFAULT_TIERS, FALLBACK_CONFIG, preview };

@@ -16,31 +16,33 @@ Rationale:
   chain is preserved; when `modelOverride` supplied, child's chain comes from
   preserved `modelRole`).
 - Fires exactly once per spawned child, in the parent session, before model
-  resolution. One event = one routing decision.
-- `tool_call` was rejected: the task wire schema (arktype `"+":"delete"`)
-  has no passthrough `model` field and stripped keys can't reach spawn model
-  resolution (notes §2a).
+  resolution. A uniquely correlated event produces one routing decision.
+- `tool_call` observes inputs only. Current OMP supports an explicit `model`
+  selector; routing uses the spawn hook without rewriting tool arguments.
 
 Event gives `agent`, `invocationKind`, `modelRole`, `patterns`, `spawnKey`.
 It does NOT give task/solutionSpace text. To classify we need it — get it
 from the `tool_call` event on `task`, which carries the raw input.
 
-### Two-event pairing
+### Lifecycle correlation
 
-- `tool_call` (toolName === "task"): stash flat `task`/`solutionSpace` +
-  batch `tasks[]` items, keyed on `toolCallId`; remember whether the input
-  contained an explicit `model` key (it can't — schema has none — but check
-  `input` defensively; internal callers bypass arktype).
-- `before_subagent_spawn`: pop pending classification input by matching spawn
-  context. When the spawn has no matching stashed text (eval `agent()`,
-  speculative launches that were adopted), record outcome
-  `task_left_unchanged` and return undefined.
+- `tool_call` captures flat or batch text by call ID and original index;
+  repeated events replace that call only. `tool_execution_start` refreshes
+  executed arguments after other extensions and validation.
+- `tool_execution_update` binds progress-row agent IDs to call/index.
+- `before_subagent_spawn` consumes exactly one indexed or progress-bound key
+  before its first await. Invocation order is irrelevant; labels that could
+  impersonate another call/index are rejected as ambiguous.
+- Approval rejection, error results and execution errors purge the call.
+  Successful returns retain only pending/running background progress rows;
+  turn end drops unbound leftovers, and session switch/shutdown clears all.
 
-Batch mode: one `tool_call` may precede N `before_subagent_spawn` events with
-per-item solutionSpaces. The event carries only `spawnKey` — the task tool
-reserves ids; our pairing uses a FIFO queue per process keyed stashed items in
-order. `ponytail:` heuristic — good enough for sequential scheduling; exact
-batch-item ↔ spawn correlation is not exposed by OMP.
+OMP chooses `spawnKey` from allocated ID, label, or `parentToolCallId:index`,
+in that order. Labels alone cannot distinguish allocated IDs from input names.
+Unmatched/ambiguous keys and eval spawns return undefined without classification.
+Named synchronous and early speculative launches without progress binding
+therefore retain OMP's model. Full coverage needs origin call ID/index on the
+spawn event; no FIFO or name heuristic is used.
 
 ## Classification
 
@@ -54,12 +56,16 @@ batch-item ↔ spawn correlation is not exposed by OMP.
 - Parse output: accept raw word or `{"tier": "...", "reason": "..."}` (strip
   fences, take last line if it parses as JSON, else trim to first word).
 - Validate tier ∈ configured tiers; else outcome `unknown_tier` → defaultTier.
-- Reentrancy: module-level boolean guard around classifier invocation; our
-  classifier never calls `task`.
-- Timeout: `AbortSignal.any([spawn signal, AbortSignal.timeout(cfg.classifierTimeoutMs=8000)])`;
-  timeout → outcome `classifier_timeout` → defaultTier.
-- Cache: Map keyed `sha256(taskText + "\n\u0000\n" + solutionSpace + classifier model+prompt fingerprint)`,
-  capped at 256 entries (insertion-order evict). In-memory, per process.
+- The classifier calls a provider directly, never `task`; no reentrancy guard.
+- Timeout: native `AbortSignal.timeout(classifier.timeoutMs)`, combined with
+  an optional caller signal. Provider aborted responses and transport errors
+  preserve the signal reason; timeout/abort → `classifier_timeout` → defaultTier.
+  The spawn event does not expose its cancellation signal to the extension.
+- Cache: Map keyed by JSON-encoded task, solution space, classifier model, full
+  prompt and ordered tier IDs. Reload compares these configuration inputs;
+  mapping-only changes retain classifications. Keys also isolate in-flight
+  results from later configuration changes. Maximum 256 entries, insertion-order
+  eviction, per extension factory.
 
 ## Routing
 
@@ -73,15 +79,17 @@ batch-item ↔ spawn correlation is not exposed by OMP.
 - Result: `return { model: tier.model, note: "task-router:<tier> reason" }`.
 - Missing tier mapping (`no_mapping`) or undefined resolved patterns →
   leave input untouched (`task_left_unchanged`).
-- `modelRole !== undefined && cfg.respectExplicitModel` → only bypass when the
-  role came from an **explicit** source. Distinguishing explicit from
-  inherited: `modelRole === "default"` or `modelRole === "task"` where the
-  agent definition ships `model: "@task"` are indistinguishable from user
-  selection at this event; OMP does not expose request-level explicitness
-  (notes §6). Decision: route everything whose `modelRole` is undefined or in
-  {`task`,`default`} (the inheritance defaults for the generic task agent),
-  bypass when `patterns`/`modelRole` indicate any other explicit alias.
-  Configurable via `respectExplicitModel`.
+- `enabled: false` bypasses automatic routing before classification. Commands
+  and the menu toggle only `enabled`; they do not change `respectExplicitModel`.
+- With `respectExplicitModel: true`, undefined `modelRole` denotes a concrete
+  model/pattern selector and bypasses classification. Roles `task`, `default`,
+  and roles matching configured tier IDs remain routable; all other roles
+  bypass classification. The effective role is the authority, not the source
+  of the selector: explicitly passing `model: "@task"` still permits routing,
+  and mapping `modelRoles.task` to a concrete model does not make the task
+  explicit. OMP does not expose request-level explicitness at this event
+  (notes §6). With `respectExplicitModel: false`, these preservation bypasses
+  are disabled, but `enabled` and safe correlation are still required.
 - Session model override (`--model`): `applySpawnHook` does NOT consult it for
   patterns that came from agent defaults, so neither do we.
 
@@ -115,15 +123,12 @@ conventions; YAML only for OMP core settings):
 }
 ```
 
-Loaded lazily per session start + on `/task-router reload`; schema-validated
-(missing/extra keys tolerated, unknown tier refs warn, invalid config →
-disable router + notify once; never break OMP startup: top-level try/catch
-in factory).
+Loaded on correlated spawns and `/task-router reload`. Missing keys use
+defaults; malformed files disable routing. The spawn handler fails open.
 
 ## History
 
-In-memory per session (`Extension` instance state is rebound per session;
-store in a WeakMap keyed by the runner's `ctx.sessionManager.getSessionId()`),
+In-memory in the extension factory closure (rebound per OMP session),
 capped 200 entries, FIFO. Records:
 `{ ts, taskPreview, solutionSpacePreview, classifierModel, classifierTier,
 classifierReason, selectedTier, mappedModel, modelRole, patterns, effort,
@@ -160,7 +165,7 @@ omp-task-router/
   src/index.ts        — factory: register command + hooks, wiring
   src/config.ts       — load/validate/save config
   src/router.ts       — state machine: classify→tier→model, history
-  src/classifier.ts   — completeSimple wrapper + parser + cache
+  src/classifier.ts   — completeSimple wrapper + parser
   src/ui.ts           — /task-router subcommands
   tests/*.test.ts     — bun:test
 ```
@@ -177,13 +182,11 @@ mapping attempted; if that mapping missing/unresolvable → return undefined
 
 ## Testing
 
-- `tests/effort.test.ts`: run router flow with fake classifier asserting
-  result never contains effort fields; OMP's own effort parsing is unaffected
-  because we don't return it.
-- `tests/classify.test.ts`: parser word/JSON/fence/garbage cases; unknown tier
-  → defaultTier.
-- `tests/config.test.ts`: defaults, invalid config → disabled, tier add/remove.
-- `tests/router.test.ts`: explicit-model bypass, cache hits, history outcomes.
-- Integration: linked into ~/.omp plugins, run real `omp` session with a
-  scripted prompt that spawns a task, verify resolved model in session log via
-  `/task-router history`.
+- `tests/router.test.ts`: parser cases, explicit-model bypass, effort preservation,
+  warm-cache behavior, tier renames and history outcomes.
+- `tests/lifecycle.test.ts`: actual SDK sessions, agent loop, TaskTool, extension
+  runner and child yield execution using a local scripted provider. Exercises
+  rejection, preflight failure, reversed batch order, overlapping calls, queued
+  background IDs after settlement, unsafe names and real provider
+  timeout/abort/error responses.
+- Standalone smoke: `bun run tests/lifecycle.test.ts --smoke` (no cloud requests).
